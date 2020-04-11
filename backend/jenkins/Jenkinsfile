@@ -1,0 +1,141 @@
+pipeline {
+    agent any
+
+    environment {
+        // files
+        def baseDir        = 'backend'
+        def dockerDir      = "$baseDir/docker"
+        def dockerFileName = 'Dockerfile'
+
+        // repo
+        def appModule         = 'app'
+        def repoName          = 'flowernetes'
+        def repoCredentialsId = 'b1ndgithub'
+        def prodBranchPattern = '(master)|(release.*)'
+        def devBranch         = 'develop'
+        def prodProfile       = 'prod'
+        def devProfile        = 'dev'
+        def jarDir            = "$appModule/build/libs"
+        def propsDir          = "$appModule/src/main/resources"
+
+        // postgres
+        def postgresCredentialsId = 'flowernetes_postgres'
+
+        // build (available after Init step)
+        def branch     = ''
+        def jarName    = ''
+        def baseName   = ''
+        def version    = ''
+        def profile    = ''
+        def serverPort = ''
+
+        // docker
+        def jarNameArg    = 'jarName'
+        def profileArg    = 'profile'
+        def serverPortArg = 'serverPort'
+        def dsUserArg     = 'dsUser'
+        def dsPasswordArg = 'dsPassword'
+        // available after Build docker image
+        def image     = null
+        def imageName = ''
+    }
+
+    stages {
+
+        stage('Init') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: repoCredentialsId, usernameVariable: 'REPO_USERNAME', passwordVariable: 'REPO_PASSWORD')]) {
+                    sh "git clone https://$REPO_USERNAME:$REPO_PASSWORD@github.com/$REPO_USERNAME/${repoName}.git"
+                }
+                script {
+                    branch = GITHUB_BRANCH_NAME ? GITHUB_BRANCH_NAME : devBranch
+                    dir(repoName) {
+                        sh "git checkout $branch"
+                        sh 'chmod +x gradlew'
+
+                        // init gradle daemon so stdout prints tasks fine
+                        sh "./gradlew projects"
+
+                        baseName = stdoutFirstLine("./gradlew $appModule:printBaseName")
+                        version = stdoutFirstLine("./gradlew $appModule:printVersion")
+                        jarName = stdoutFirstLine("./gradlew $appModule:printJarName")
+
+                        echo "baseName: $baseName"
+                        echo "version: $version"
+                        echo "jarName: $jarName"
+                    }
+                    switch (branch) {
+                        case ~/$prodBranchPattern/:
+                            profile = prodProfile
+                            break
+                        default:
+                            profile = devProfile
+                    }
+                    echo "chose $profile Spring profile"
+
+                    def propsName = "application-${profile}.properties"
+                    echo "propsName: $propsName"
+
+                    def props = readProperties file: "$repoName/$propsDir/$propsName"
+                    serverPort = props."server.port"
+                    echo "serverPort: $serverPort"
+                }
+            }
+        }
+
+        stage('Build project') {
+            steps {
+                dir(repoName) {
+                    sh './gradlew build'
+                }
+            }
+        }
+
+        stage('Build docker image') {
+            steps {
+                script {
+                    def dockerContextDir = "./$repoName/$jarDir/"
+                    imageName = "$baseName:$version"
+
+                    withCredentials([usernamePassword(credentialsId: postgresCredentialsId, usernameVariable: 'POSTGRES_USERNAME', passwordVariable: 'POSTGRES_PASSWORD')]) {
+                        image = docker.build(imageName, """
+                        | -f ./$dockerDir/$dockerFileName
+                        | --build-arg $jarNameArg=$jarName
+                        | --build-arg $profileArg=$profile
+                        | --build-arg $serverPortArg=$serverPort
+                        | --build-arg $dsUserArg=$POSTGRES_USERNAME
+                        | --build-arg $dsPasswordArg=$POSTGRES_PASSWORD
+                        | $dockerContextDir
+                    """.stripMargin().trim().replaceAll("\n", ""))
+                    }
+                }
+            }
+        }
+
+        stage('Run docker image') {
+            steps {
+                script {
+                    def containerName = "$baseName-$profile"
+
+                    try {
+                        sh "docker stop $containerName"
+                        sh "docker rm $containerName"
+                    } catch (err) {
+                        echo "${err.getMessage()}"
+                    }
+                    sh "docker run -p $serverPort:$serverPort --name $containerName -d $imageName"
+                }
+            }
+        }
+
+    }
+    post {
+        cleanup {
+            cleanWs()
+        }
+    }
+}
+
+String stdoutFirstLine(GString cmd) {
+    return sh(script: "$cmd 2>&1 | head -n 1", returnStdout: true).trim()
+}
