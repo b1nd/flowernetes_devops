@@ -100,6 +100,7 @@ pipeline {
                     withCredentials([usernamePassword(credentialsId: postgresCredentialsId, usernameVariable: 'POSTGRES_USERNAME', passwordVariable: 'POSTGRES_PASSWORD')]) {
                         image = docker.build(imageName, """
                         | -f ./$dockerDir/$dockerFileName
+                        | --network host
                         | --build-arg $jarNameArg=$jarName
                         | --build-arg $profileArg=$profile
                         | --build-arg $serverPortArg=$serverPort
