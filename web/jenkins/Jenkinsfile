@@ -1,0 +1,133 @@
+pipeline {
+    agent any
+
+    tools {
+        nodejs "nodejs"
+    }
+
+    environment {
+        // files
+        def distDir        = 'dist'
+        def baseDir        = 'web'
+        def nginxDir       = "$baseDir/nginx"
+        def dockerDir      = "$baseDir/docker"
+        def dockerFileName = 'Dockerfile'
+
+        // repo
+        def repoName          = 'flowernetes_web'
+        def baseName          = "$repoName"
+        def repoCredentialsId = 'b1ndgithub'
+        def prodBranchPattern = '(master)|(release.*)'
+        def devBranch         = 'develop'
+        def prodProfile       = 'prod'
+        def devProfile        = 'dev'
+
+        // nginx
+        def nginxName      = 'nginx'
+        def devListenPort  = '3333'
+        def prodListenPort = '4444'
+        def nginxConfName  = "${nginxName}.conf"
+
+        // build (available after init step)
+        def branch     = ''
+        def profile    = ''
+        def version    = ''
+        def nginxConf  = ''
+        def serverPort = ''
+
+        // docker
+        def serverPortArg = "serverPort"
+        // available after build docker image step
+        def image     = null
+        def imageName = ''
+    }
+
+    stages {
+
+        stage('Init') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: repoCredentialsId, usernameVariable: 'REPO_USERNAME', passwordVariable: 'REPO_PASSWORD')]) {
+                    sh "git clone https://$REPO_USERNAME:$REPO_PASSWORD@github.com/$REPO_USERNAME/${repoName}.git"
+                }
+                script {
+                    branch = GITHUB_BRANCH_NAME ? GITHUB_BRANCH_NAME : devBranch
+                    dir(repoName) {
+                        sh "git checkout $branch"
+
+                        switch (branch) {
+                            case ~/$prodBranchPattern/:
+                                profile = prodProfile
+                                version = stdoutFirstLine('git describe --tags "$(git rev-list --tags=*.*.* --max-count=1 2> /dev/null)" 2> /dev/null || echo 0.0.0')
+                                serverPort = prodListenPort
+                                break
+                            default:
+                                profile = devProfile
+                                version = stdoutFirstLine('git rev-parse --verify --short HEAD')
+                                serverPort = devListenPort
+                        }
+                        nginxConf = "$nginxName-${profile}.conf"
+
+                        echo "baseName: $baseName"
+                        echo "profile: $profile"
+                        echo "version: $version"
+                        echo "serverPort: $serverPort"
+                    }
+                }
+            }
+        }
+
+        stage('Build project') {
+            steps {
+                dir(repoName) {
+                    sh 'npm install'
+                    sh 'npm run build'
+                }
+            }
+        }
+
+        stage('Build docker image') {
+            steps {
+                script {
+                    def dockerContextDir = "./$repoName/$distDir"
+
+                    sh "cp $nginxDir/$nginxConf $dockerContextDir/$nginxConfName"
+
+                    imageName = "$baseName:$version"
+
+                    image = docker.build(imageName, """
+                        | -f ./$dockerDir/$dockerFileName
+                        | --network host
+                        | --build-arg $serverPortArg=$serverPort
+                        | $dockerContextDir
+                    """.stripMargin().trim().replaceAll("\n", ""))
+                }
+            }
+        }
+
+        stage('Run docker image') {
+            steps {
+                script {
+                    def containerName = "$baseName-$profile"
+
+                    try {
+                        sh "docker stop $containerName"
+                        sh "docker rm $containerName"
+                    } catch (err) {
+                        echo "${err.getMessage()}"
+                    }
+                    sh "docker run -p $serverPort:$serverPort --name $containerName -d $imageName"
+                }
+            }
+        }
+
+    }
+    post {
+        cleanup {
+            cleanWs()
+        }
+    }
+}
+
+String stdoutFirstLine(String cmd) {
+    return sh(script: "$cmd 2>&1 | head -n 1", returnStdout: true).trim()
+}
